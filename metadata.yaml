@@ -39,3 +39,6 @@ storage:
     minimum-size: 10G
     multiple:
       range: 0-1
+peers:
+  cluster:
+    interface: microcloud-cluster
