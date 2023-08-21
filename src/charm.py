@@ -405,13 +405,6 @@ class MaasMicrocloudCharmCharm(CharmBase):
         if microovn:
             self._stored.config["snap-channel-microovn"] = microovn_channel
 
-    def lxd_monitor_lifecycle(self) -> None:
-        """Monitor lifecycle events (blocking)."""
-        event_types = {pylxd.EventType.Lifecycle}
-        events = pylxd.Client().events(event_types=event_types)
-        events.connect()
-        events.run()
-
     def microcloud_reload(self) -> None:
         """Reload the microcloud daemon."""
         self.unit_maintenance("Reloading Microcloud")
