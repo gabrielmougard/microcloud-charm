@@ -28,5 +28,5 @@ options:
     description: The snap store channel for MicroCeph to use
   snap-channel-microovn:
     type: string
-    default: "latest/stable"
+    default: "latest/edge"
     description: The snap store channel for MicroOVN to use
