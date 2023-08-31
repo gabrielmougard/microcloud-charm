@@ -2,6 +2,12 @@
 
 The **Microcloud charmed operator** provides a simple way to deploy [Microcloud](https://microcloud.is/) at scale using [Juju](https://jaas.ai/).
 
+## Roadmap
+
+- [x] Add support for `microceph` and `microovn` in the charm
+- [x] Support the setup of a microcloud cluster using `--auto`
+- [ ] Support the setup of a microcloud cluster using `--preseed <YAML_CONFIG>`
+
 ## Getting started with Juju
 
 Follow `Juju`'s [Charmed Operator Lifecycle Manager](https://juju.is/docs/olm) to boostrap your cloud of choice and create a model to host your LXD application. Once done, deploying a Microcloud unit is as simple as:
