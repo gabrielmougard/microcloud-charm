@@ -2,21 +2,20 @@
 
 """Microcloud charm."""
 
-import json
 import logging
 import os
 import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from typing import Dict, List, Union
 
 from ops.charm import (
     CharmBase,
     ConfigChangedEvent,
     InstallEvent,
-    RelationChangedEvent,
-    RelationDepartedEvent,
+    RelationCreatedEvent,
     RelationJoinedEvent,
     StartEvent,
     UpdateStatusEvent,
@@ -57,10 +56,6 @@ class MaasMicrocloudCharmCharm(CharmBase):
         # Relation event handlers
         self.framework.observe(self.on.cluster_relation_created, self._on_cluster_relation_created)
         self.framework.observe(self.on.cluster_relation_joined, self._on_cluster_relation_joined)
-        self.framework.observe(self.on.cluster_relation_changed, self._on_cluster_relation_changed)
-        self.framework.observe(
-            self.on.cluster_relation_departed, self._on_cluster_relation_departed
-        )
 
     @property
     def peers(self):
@@ -106,8 +101,13 @@ class MaasMicrocloudCharmCharm(CharmBase):
         # Apply sideloaded resources attached at deploy time
         self.resource_sideload()
 
-        # Installation done
-        self.set_peer_data_str(self.unit, "ready_to_init", "True")
+    def _on_cluster_relation_created(self, event: RelationCreatedEvent) -> None:
+        """We must wait for all units to be ready before initializing Microcloud."""
+        self.set_peer_data_str(self.unit, "new_node", "True")
+        if not self.unit.is_leader():
+            time.sleep(30)  # Make sure that the leader has time to initialize the cluster
+
+        return
 
     def _on_charm_start(self, event: StartEvent) -> None:
         logger.info("Starting the Microcloud charm")
@@ -115,6 +115,65 @@ class MaasMicrocloudCharmCharm(CharmBase):
         if self.config_changed():
             logger.debug("Pending config changes detected")
             self._on_charm_config_changed(event)
+
+        one_unit_clustered = False
+        for unit in self.peers.units:
+            if self.peers.data[unit].get("clustered") == "True":
+                one_unit_clustered = True
+                break
+
+        if one_unit_clustered:
+            # check if this unit has been clustered by the init process
+            try:
+                subprocess.run(
+                    ["lxc", "cluster", "list"], check=True, timeout=600,
+                )
+                self.set_peer_data_str(self.unit, "clustered", "True")
+                self.set_peer_data_str(self.unit, "new_node", "")
+                self.unit_active("Healthy Microcloud unit")
+                return
+            except subprocess.CalledProcessError as e:
+                self.unit_waiting(f"This unit has not joined the cluster yet")
+                event.defer()
+                return
+            except subprocess.TimeoutExpired as e:
+                self.unit_blocked(f"This unit timed out checking its clustered status")
+                return
+
+        new_peers = [self.peers.data[unit].get("new_node") == "True" for unit in self.peers.units]
+        if (
+            self.unit.is_leader()
+            and self.get_peer_data_str(self.unit, "new_node") == "True"
+            and all(new_peers)
+            and self.app.planned_units() == len(self.peers.units) + 1
+        ):
+            try:
+                self.microcloud_init()
+                self.set_peer_data_str(
+                    self.unit, "clustered", "True"
+                )  # This unit is sure to be clustered
+                self.set_peer_data_str(self.unit, "new_node", "")  # Not a new node anymore
+                self.unit_active("Microcloud successfully initialized")
+                logger.info("Microcloud successfully initialized")
+                return
+            except RuntimeError as e:
+                logger.error(f"Failed to initialize Microcloud: {e}")
+                # TODO: Even if there is an error code (for example,
+                # `ceph --name client.admin --cluster ceph osd pool create lxd_remote 32: exit status 1 (Error initializing cluster client: ObjectNotFound('RADOS object not found (error calling conf_read_file)')`)
+                # the cluster is still initialized and inspecting the the disks with `microceph disk list` and `microceph cluster list` shows that everything is fine.
+                self.set_peer_data_str(self.unit, "clustered", "True")
+
+        time.sleep(10)  # Wait a bit before deferring the event
+
+        if self.unit.is_leader():
+            logger.error(f"Leader needs to wait for all units to be ready to bootstrap")
+            self.unit_waiting(f"Leader needs to wait for all units to be ready to bootstrap")
+        else:
+            logger.error(f"Unit needs to wait for all units to be ready to bootstrap")
+            self.unit_waiting(f"Unit needs to wait for all units to be ready to bootstrap")
+
+        event.defer()
+        return
 
     def _on_update_status(self, event: UpdateStatusEvent) -> None:
         """Regularly check if the unit is clustered."""
@@ -126,18 +185,14 @@ class MaasMicrocloudCharmCharm(CharmBase):
             self.unit_active("Healthy Microcloud unit")
         except subprocess.CalledProcessError as e:
             self.unit_blocked(f"This unit has failed to join the cluster")
-            event.defer()
             return
         except subprocess.TimeoutExpired as e:
             self.unit_blocked(f"This unit timed out checking its clustered status")
-            event.defer()
             return
 
     def _on_charm_config_changed(self, event: Union[ConfigChangedEvent, StartEvent]) -> None:
         """React to configuration changes. (JuJu refresh)"""
         logger.info("Updating charm config")
-
-        error = False
 
         # Confirm that the config is valid
         if not self.config_is_valid():
@@ -167,110 +222,17 @@ class MaasMicrocloudCharmCharm(CharmBase):
             event.defer()
             return
 
-        logger.info(f"[GABRIELMOUGARD] DATA peers (CONFIG CHANGED): {self.peers.data}")
-
-    def _on_cluster_relation_created(self, event: RelationChangedEvent) -> None:
-        """We must wait for all units to be ready before initializing Microcloud."""
-        peers_bootstrapped = all(
-            [self.peers.data[unit].get("ready_to_init") == "True" for unit in self.peers.units]
-        )
-
-
-        logger.info(f"[GABRIELMOUGARD] DATA peers (RELATION CREATED): {self.peers.data}")
-
-        if len(self.peers.units) > 0:
-            for unit in self.peers.units:
-                logger.info(f"[GABRIELMOUGARD] {unit.name} ready to init ? : {self.peers.data[unit].get('ready_to_init')}")
-
-        if self.get_peer_data_str(self.unit, "ready_to_init") == "True" and peers_bootstrapped:
-            try:
-                self.microcloud_init()
-                self.set_peer_data_str(self.unit, "clustered", "True")
-                self.unit_active("Microcloud successfully initialized")
-                logger.info("Microcloud successfully initialized")
-            except RuntimeError:
-                logger.error("Failed to initialize Microcloud")
-                self.unit_blocked("Failed to initialize Microcloud")
-                event.defer()
-                return
-        else:
-            logger.info("Waiting for all units to be ready to bootstrap")
-            self.unit_waiting("Waiting for all units to be ready to bootstrap")
-            return
-
     def _on_cluster_relation_joined(self, event: RelationJoinedEvent) -> None:
-        """When a new unit joins the cluster"""
-        
-        logger.info(f"[GABRIELMOUGARD] DATA peers (RELATION JOINED): {self.peers.data}")
-        
-        if self.unit == event.unit:
-            self.set_peer_data_str(event.unit, "ready_to_be_added", "True")
-
-    def _on_cluster_relation_changed(self, event: RelationChangedEvent) -> None:
         """Add a new node to the existing Microcloud cluster"""
-        logger.info(f"[GABRIELMOUGARD] DATA peers (RELATION CHANGED): {self.peers.data}")
-        
-        
-        if self.get_peer_data_str(self.unit, "clustered") == "True":
-            # If there's a new unit available for bootstrap,
-            # try to add it to the cluster
-            peer_add_needed = False
-            unit_names_to_add = []
-            for unit in self.peers.units:
-                if self.peers.data[unit].get("ready_to_be_added") == "True":
-                    peer_add_needed = True
-                    unit_names_to_add.append(unit.name)
-
-            if peer_add_needed:
-                # scaling: Try to add the new peers to the cluster
-                try:
-                    self.microcloud_add()
-                    logger.info(
-                        f"Unit(s) {','.join(unit_names_to_add)} have successfully joined the cluster"
-                    )
-                except RuntimeError:
-                    logger.error("Failed to add a new node to the cluster")
-                    event.defer()
-                    return
-
-            # Update the status of the unit
+        if self.unit.is_leader() and self.get_peer_data_str(self.unit, "clustered") == "True":
             try:
-                subprocess.run(
-                    ["lxc", "cluster", "list"], check=True, timeout=600,
-                )
-                self.unit_active("Healthy Microcloud unit")
-            except subprocess.CalledProcessError as e:
-                self.unit_blocked(f"This unit has failed to join the cluster")
-                event.defer()
+                self.microcloud_add()
+                logger.info("New Microcloud node successfully added")
                 return
-            except subprocess.TimeoutExpired as e:
-                self.unit_blocked(f"This unit timed out checking its clustered status")
-                event.defer()
+            except RuntimeError:
+                logger.error("Failed to add a new Microcloud node")
+                # event.defer()
                 return
-        else:
-            # Maybe the status hasn't been updated yet.
-            # For example, this unit might have been added by an other
-            # clustered unit, and the status needs to be updated in its databag now.
-            try:
-                subprocess.run(
-                    ["lxc", "cluster", "list"], check=True, timeout=600,
-                )
-                self.set_peer_data_str(self.unit, "clustered", "True")
-                self.unit_active("Healthy Microcloud unit")
-            except subprocess.CalledProcessError as e:
-                self.unit_blocked(f"This unit has failed to join the cluster")
-                event.defer()
-                return
-            except subprocess.TimeoutExpired as e:
-                self.unit_blocked(f"This unit timed out checking its clustered status")
-                event.defer()
-                return
-
-    def _on_cluster_relation_departed(self, event: RelationDepartedEvent) -> None:
-        """Remove a new node to the existing Microcloud cluster"""
-        logger.info("Remove a node from Microcloud")
-        # TODO: implement microcloud remove
-        return
 
     def config_changed(self) -> Dict:
         """Figure out what changed."""
@@ -319,7 +281,11 @@ class MaasMicrocloudCharmCharm(CharmBase):
 
         try:
             microcloud_process_add = subprocess.run(
-                ["microcloud", "add", "--auto"], capture_output=True, check=True, timeout=600, text=True,
+                ["microcloud", "add", "--auto"],
+                capture_output=True,
+                check=True,
+                timeout=600,
+                text=True,
             )
             logger.info(f"Microcloud node(s) successfully added:\n{microcloud_process_add.stdout}")
         except subprocess.CalledProcessError as e:
@@ -364,12 +330,12 @@ class MaasMicrocloudCharmCharm(CharmBase):
             self.unit_maintenance(f"Installing MicroOVN snap (channel={microovn_channel_name})")
 
         try:
-            logger.info("Refreshing snapd...")
+            self.unit_maintenance("Refreshing snapd...")
             subprocess.run(
                 ["snap", "refresh"], capture_output=True, check=True, timeout=600,
             )
-            logger.info("snapd refreshed successfully.")
-            logger.info("Installing core core20 core22...")
+            self.unit_maintenance("snapd refreshed successfully.")
+            self.unit_maintenance("Installing core core20 core22...")
             cohort = ["--cohort=+"]
             subprocess.run(
                 ["snap", "install", "core", "core20", "core22"] + cohort,
@@ -377,10 +343,10 @@ class MaasMicrocloudCharmCharm(CharmBase):
                 check=True,
                 timeout=600,
             )
-            logger.info("core core20 core22 installed successfully...")
+            self.unit_maintenance("core core20 core22 installed successfully...")
 
             # LXD
-            logger.info("Installing LXD...")
+            self.unit_maintenance("Installing LXD...")
             subprocess.run(
                 ["snap", "install", "lxd", f"--channel={lxd_channel}"] + cohort,
                 capture_output=True,
@@ -393,14 +359,14 @@ class MaasMicrocloudCharmCharm(CharmBase):
                 check=True,
                 timeout=600,
             )
-            logger.info("LXD installed successfully.")
+            self.unit_maintenance("LXD installed successfully.")
             if os.path.exists("/var/lib/lxd"):
                 subprocess.run(
                     ["lxd.migrate", "-yes"], capture_output=True, check=True, timeout=600
                 )
 
             # Microcloud
-            logger.info("Installing Microcloud...")
+            self.unit_maintenance("Installing Microcloud...")
             subprocess.run(
                 ["snap", "install", "microcloud", f"--channel={microcloud_channel}"] + cohort,
                 capture_output=True,
@@ -413,11 +379,11 @@ class MaasMicrocloudCharmCharm(CharmBase):
                 check=True,
                 timeout=600,
             )
-            logger.info("Microcloud installed successfully.")
+            self.unit_maintenance("Microcloud installed successfully.")
 
             # MicroCeph
             if microceph:
-                logger.info("Installing Microceph...")
+                self.unit_maintenance("Installing Microceph...")
                 subprocess.run(
                     ["snap", "install", "microceph", f"--channel={microceph_channel}"] + cohort,
                     capture_output=True,
@@ -430,11 +396,11 @@ class MaasMicrocloudCharmCharm(CharmBase):
                     check=True,
                     timeout=600,
                 )
-                logger.info("Microceph installed successfully.")
+                self.unit_maintenance("Microceph installed successfully.")
 
             # MicroOVN
             if microovn:
-                logger.info("Installing Microovn...")
+                self.unit_maintenance("Installing Microovn...")
                 subprocess.run(
                     ["snap", "install", "microovn"] + cohort,
                     capture_output=True,
@@ -447,7 +413,7 @@ class MaasMicrocloudCharmCharm(CharmBase):
                     check=True,
                     timeout=600,
                 )
-                logger.info("Microovn installed successfully.")
+                self.unit_maintenance("Microovn installed successfully.")
         except subprocess.CalledProcessError as e:
             self.unit_blocked(f'Failed to run "{e.cmd}": {e.stderr} ({e.returncode})')
             raise RuntimeError
