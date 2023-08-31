@@ -33,13 +33,9 @@ touch microcloud_empty.snap
 juju attach-resource microcloud microcloud-snap=microcloud_empty.snap
 ```
 
-## Storage
+## Tutorial
 
-To use local storage with one disk of at least `10GiB` as local `ZFS` storage backend:
-
-```shell
-juju deploy ch:microcloud --storage local=10G,1
-```
+You can follow the setup instructions in `tuto/README.md` to setup a MAAS cluster with Juju with a custom image server and deploy the charm on a cluster of 3 machines.
 
 ## Additional information
 
