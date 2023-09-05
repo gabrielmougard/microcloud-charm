@@ -16,15 +16,15 @@ options:
     default: false
   snap-channel-lxd:
     type: string
-    default: "latest/stable"
+    default: "latest/edge"
     description: The snap store channel for LXD to use
   snap-channel-microcloud:
     type: string
-    default: "latest/stable"
+    default: "latest/edge"
     description: The snap store channel for MicroCloud to use
   snap-channel-microceph:
     type: string
-    default: "latest/stable"
+    default: "latest/edge"
     description: The snap store channel for MicroCeph to use
   snap-channel-microovn:
     type: string
