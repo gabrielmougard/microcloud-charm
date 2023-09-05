@@ -13,10 +13,6 @@ sudo snap install jq
 sudo snap install maas
 sudo snap install maas-test-db
 
-# clone the git repository
-cd ~
-git clone https://github.com/antongisli/maas-baremetal-k8s-tutorial.git
-
 # get local interface name (this assumes a single default route is present)
 export INTERFACE=$(ip route | grep default | awk '!/wlan|wlp|wifi/ {print $5}')
 export IP_ADDRESS=$(ip -4 addr show dev $INTERFACE | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
