@@ -44,7 +44,9 @@ class MaasMicrocloudCharmCharm(CharmBase):
 
         # Initialize the persistent storage if needed
         self._stored.set_default(
-            config={}, microcloud_binary_path="", microcloud_snap_path="",
+            config={},
+            microcloud_binary_path="",
+            microcloud_snap_path="",
         )
 
         # Main event handlers
@@ -126,7 +128,9 @@ class MaasMicrocloudCharmCharm(CharmBase):
             # check if this unit has been clustered by the init process
             try:
                 subprocess.run(
-                    ["lxc", "cluster", "list"], check=True, timeout=600,
+                    ["lxc", "cluster", "list"],
+                    check=True,
+                    timeout=600,
                 )
                 self.set_peer_data_str(self.unit, "clustered", "True")
                 self.set_peer_data_str(self.unit, "new_node", "")
@@ -158,18 +162,16 @@ class MaasMicrocloudCharmCharm(CharmBase):
                 return
             except RuntimeError as e:
                 logger.error(f"Failed to initialize Microcloud: {e}")
-                # TODO: Even if there is an error code (for example,
-                # `ceph --name client.admin --cluster ceph osd pool create lxd_remote 32: exit status 1 (Error initializing cluster client: ObjectNotFound('RADOS object not found (error calling conf_read_file)')`)
-                # the cluster is still initialized and inspecting the the disks with `microceph disk list` and `microceph cluster list` shows that everything is fine.
-                self.set_peer_data_str(self.unit, "clustered", "True")
+                self.unit_blocked("Failed to initialize Microcloud")
+                return
 
         time.sleep(10)  # Wait a bit before deferring the event
 
         if self.unit.is_leader():
-            logger.error(f"Leader needs to wait for all units to be ready to bootstrap")
+            logger.warning(f"Leader needs to wait for all units to be ready to bootstrap")
             self.unit_waiting(f"Leader needs to wait for all units to be ready to bootstrap")
         else:
-            logger.error(f"Unit needs to wait for all units to be ready to bootstrap")
+            logger.warning(f"Unit needs to wait for all units to be ready to bootstrap")
             self.unit_waiting(f"Unit needs to wait for all units to be ready to bootstrap")
 
         event.defer()
@@ -179,7 +181,9 @@ class MaasMicrocloudCharmCharm(CharmBase):
         """Regularly check if the unit is clustered."""
         try:
             subprocess.run(
-                ["lxc", "cluster", "list"], check=True, timeout=600,
+                ["lxc", "cluster", "list"],
+                check=True,
+                timeout=600,
             )
             self.set_peer_data_str(self.unit, "clustered", "True")
             self.unit_active("Healthy Microcloud unit")
@@ -224,14 +228,17 @@ class MaasMicrocloudCharmCharm(CharmBase):
 
     def _on_cluster_relation_joined(self, event: RelationJoinedEvent) -> None:
         """Add a new node to the existing Microcloud cluster"""
-        if self.unit.is_leader() and self.get_peer_data_str(self.unit, "clustered") == "True":
+        if (
+            self.unit.is_leader()
+            and self.get_peer_data_str(self.unit, "clustered") == "True"
+            and event.unit != self.unit # Don't add the leader to the cluster as it is already there
+        ):
             try:
                 self.microcloud_add()
                 logger.info("New Microcloud node successfully added")
                 return
             except RuntimeError:
                 logger.error("Failed to add a new Microcloud node")
-                # event.defer()
                 return
 
     def config_changed(self) -> Dict:
@@ -267,6 +274,13 @@ class MaasMicrocloudCharmCharm(CharmBase):
                 timeout=600,
                 text=True,
             )
+
+            subprocess.run(
+                ["microceph", "enable", "rgw"],
+                check=True,
+                timeout=600,
+            )
+
             logger.info(f"Microcloud successfully initialized:\n{microcloud_process_init.stdout}")
         except subprocess.CalledProcessError as e:
             self.unit_blocked(f'Failed to run "{e.cmd}": {e.stderr} ({e.returncode})')
@@ -332,7 +346,10 @@ class MaasMicrocloudCharmCharm(CharmBase):
         try:
             self.unit_maintenance("Refreshing snapd...")
             subprocess.run(
-                ["snap", "refresh"], capture_output=True, check=True, timeout=600,
+                ["snap", "refresh"],
+                capture_output=True,
+                check=True,
+                timeout=600,
             )
             self.unit_maintenance("snapd refreshed successfully.")
             self.unit_maintenance("Installing core core20 core22...")
@@ -396,6 +413,18 @@ class MaasMicrocloudCharmCharm(CharmBase):
                     check=True,
                     timeout=600,
                 )
+
+                subprocess.run(
+                    ["rm", "-rf", "/etc/ceph"],
+                    check=True,
+                    timeout=600,
+                )
+                subprocess.run(
+                    ["ln", "-s", "/var/snap/microceph/current/conf/", "/etc/ceph"],
+                    check=True,
+                    timeout=600,
+                )
+
                 self.unit_maintenance("Microceph installed successfully.")
 
             # MicroOVN
