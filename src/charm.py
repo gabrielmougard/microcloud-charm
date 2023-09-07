@@ -17,6 +17,8 @@ from ops.charm import (
     InstallEvent,
     RelationCreatedEvent,
     RelationJoinedEvent,
+    RelationDepartedEvent,
+    RelationBrokenEvent,
     StartEvent,
     UpdateStatusEvent,
 )
@@ -44,9 +46,7 @@ class MaasMicrocloudCharmCharm(CharmBase):
 
         # Initialize the persistent storage if needed
         self._stored.set_default(
-            config={},
-            microcloud_binary_path="",
-            microcloud_snap_path="",
+            config={}, microcloud_binary_path="", microcloud_snap_path="",
         )
 
         # Main event handlers
@@ -58,6 +58,10 @@ class MaasMicrocloudCharmCharm(CharmBase):
         # Relation event handlers
         self.framework.observe(self.on.cluster_relation_created, self._on_cluster_relation_created)
         self.framework.observe(self.on.cluster_relation_joined, self._on_cluster_relation_joined)
+        self.framework.observe(
+            self.on.cluster_relation_departed, self._on_cluster_relation_departed
+        )
+        self.framework.observe(self.on.cluster_relation_broken, self._on_cluster_relation_broken)
 
     @property
     def peers(self):
@@ -128,9 +132,7 @@ class MaasMicrocloudCharmCharm(CharmBase):
             # check if this unit has been clustered by the init process
             try:
                 subprocess.run(
-                    ["lxc", "cluster", "list"],
-                    check=True,
-                    timeout=600,
+                    ["lxc", "cluster", "list"], check=True, timeout=600,
                 )
                 self.set_peer_data_str(self.unit, "clustered", "True")
                 self.set_peer_data_str(self.unit, "new_node", "")
@@ -157,6 +159,12 @@ class MaasMicrocloudCharmCharm(CharmBase):
                     self.unit, "clustered", "True"
                 )  # This unit is sure to be clustered
                 self.set_peer_data_str(self.unit, "new_node", "")  # Not a new node anymore
+                # TODO: we can't say for sure that the cluster contains self.app.planned_units()
+                # some nodes might have failed to join the cluster but the command result is still a code 0.
+                # A workaround would be to parse the number of lines of `lxc cluster list -f csv` on this node.
+                self.set_peer_data_str(
+                    self.app, "num_clustered_units", str(self.app.planned_units())
+                )  # Register the size of the cluster. Useful for when we will want to add new nodes
                 self.unit_active("Microcloud successfully initialized")
                 logger.info("Microcloud successfully initialized")
                 return
@@ -181,9 +189,7 @@ class MaasMicrocloudCharmCharm(CharmBase):
         """Regularly check if the unit is clustered."""
         try:
             subprocess.run(
-                ["lxc", "cluster", "list"],
-                check=True,
-                timeout=600,
+                ["lxc", "cluster", "list"], check=True, timeout=600,
             )
             self.set_peer_data_str(self.unit, "clustered", "True")
             self.unit_active("Healthy Microcloud unit")
@@ -231,7 +237,8 @@ class MaasMicrocloudCharmCharm(CharmBase):
         if (
             self.unit.is_leader()
             and self.get_peer_data_str(self.unit, "clustered") == "True"
-            and event.unit != self.unit # Don't add the leader to the cluster as it is already there
+            and event.unit
+            != self.unit  # Don't add the leader to the cluster as it is already there
         ):
             try:
                 self.microcloud_add()
@@ -240,6 +247,21 @@ class MaasMicrocloudCharmCharm(CharmBase):
             except RuntimeError:
                 logger.error("Failed to add a new Microcloud node")
                 return
+
+    def _on_cluster_relation_departed(self, event: RelationDepartedEvent) -> None:
+        """Update the application information regarding the number of clustered units"""
+        if self.unit.is_leader():
+            num_clustered_units = int(self.get_peer_data_str(self.app, "num_clustered_units"))
+            self.set_peer_data_str(self.app, "num_clustered_units", str(num_clustered_units - 1))
+
+    def _on_cluster_relation_broken(self, event: RelationBrokenEvent) -> None:
+        """Effectively remove this node from the existing Microcloud cluster"""
+        if self.get_peer_data_str(self.unit, "clustered") == "True":
+            try:
+                self.microcloud_remove(os.uname().nodename)
+                logger.info("Microcloud node successfully removed")
+            except RuntimeError:
+                logger.error("Failed to remove a Microcloud node, retrying later")
 
     def config_changed(self) -> Dict:
         """Figure out what changed."""
@@ -276,9 +298,7 @@ class MaasMicrocloudCharmCharm(CharmBase):
             )
 
             subprocess.run(
-                ["microceph", "enable", "rgw"],
-                check=True,
-                timeout=600,
+                ["microceph", "enable", "rgw"], check=True, timeout=600,
             )
 
             logger.info(f"Microcloud successfully initialized:\n{microcloud_process_init.stdout}")
@@ -302,6 +322,26 @@ class MaasMicrocloudCharmCharm(CharmBase):
                 text=True,
             )
             logger.info(f"Microcloud node(s) successfully added:\n{microcloud_process_add.stdout}")
+        except subprocess.CalledProcessError as e:
+            self.unit_blocked(f'Failed to run "{e.cmd}": {e.stderr} ({e.returncode})')
+            raise RuntimeError
+        except subprocess.TimeoutExpired as e:
+            self.unit_blocked(f'Timeout exceeded while running "{e.cmd}"')
+            raise RuntimeError
+
+    def microcloud_remove(self, node_name_to_remove: str) -> None:
+        """Remove a node from Microcloud."""
+        self.unit_maintenance(f"Removing node from Microcloud")
+
+        try:
+            subprocess.run(
+                ["microcloud", "cluster", "remove", node_name_to_remove],
+                capture_output=True,
+                check=True,
+                timeout=600,
+                text=True,
+            )
+            logger.info("Microcloud node(s) successfully removed")
         except subprocess.CalledProcessError as e:
             self.unit_blocked(f'Failed to run "{e.cmd}": {e.stderr} ({e.returncode})')
             raise RuntimeError
@@ -346,10 +386,7 @@ class MaasMicrocloudCharmCharm(CharmBase):
         try:
             self.unit_maintenance("Refreshing snapd...")
             subprocess.run(
-                ["snap", "refresh"],
-                capture_output=True,
-                check=True,
-                timeout=600,
+                ["snap", "refresh"], capture_output=True, check=True, timeout=600,
             )
             self.unit_maintenance("snapd refreshed successfully.")
             self.unit_maintenance("Installing core core20 core22...")
@@ -415,9 +452,7 @@ class MaasMicrocloudCharmCharm(CharmBase):
                 )
 
                 subprocess.run(
-                    ["rm", "-rf", "/etc/ceph"],
-                    check=True,
-                    timeout=600,
+                    ["rm", "-rf", "/etc/ceph"], check=True, timeout=600,
                 )
                 subprocess.run(
                     ["ln", "-s", "/var/snap/microceph/current/conf/", "/etc/ceph"],
